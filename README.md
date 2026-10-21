@@ -6,6 +6,61 @@ It reports to the AWS IoT backend in `../gps_tracker_backend`, following that re
 - Design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - Power/state behaviour (draft, lower priority than the protocol): [Wake-on-Motion Lifecycle.md](Wake-on-Motion%20Lifecycle.md)
 
+## Setup
+
+1. Create `secrets.ini` in the project root (gitignored). The build reads it through `extra_configs`:
+
+   ```ini
+   [secrets]
+   ; IoT thing name = MQTT client ID, [a-zA-Z0-9_-]{1,64}
+   device_id = tracker-01
+   ; aws iot describe-endpoint --endpoint-type iot:Data-ATS --region ap-southeast-2
+   mqtt_host = xxxxxxxxxxxxxx-ats.iot.ap-southeast-2.amazonaws.com
+   ; empty = the SIM's default APN
+   apn =
+   ; output folder of ../gps_tracker_backend/scripts/provision-device.sh (read only by the provision env)
+   certs_dir = ../gps_tracker_backend/certs/tracker-01
+   ```
+
+   The firmware refuses to connect while `mqtt_host` still contains `CHANGE-ME`.
+
+2. **Provisioning** (once per device, and again whenever the certificate changes). Enter download mode by hand
+   (hold BOOT, press RST, release BOOT) before each upload. Press RST after it.
+
+   ```sh
+   pio run -e T-Call-A7670X-V1-0-bridge-provision -t upload   # writes the certs into the modem
+   pio device monitor                                          # expect "PROVISION: done"
+   pio run -e T-Call-A7670X-V1-0-bridge -t erase               # remove the image that contains the key
+   pio run -e T-Call-A7670X-V1-0-bridge -t upload              # normal firmware
+   ```
+
+   The provisioning image embeds the private key, generated into `.pio/build/` by `scripts/embed_certs.py` and never
+   into `src/`. After it runs, the key lives only in the modem's certificate store
+   (`aws_root_ca.pem`, `device_cert.pem`, `device_key.pem`). The erase step makes sure no copy stays in ESP32 flash.
+   Once provisioning is done, the provisioning firmware turns into an AT pass-through shell, which is handy for poking
+   at the modem by hand.
+
+3. **Run.** `pio device monitor` shows each state transition (`LIFE: NETWORK -> CLOCK ...`) and, with `-DAT_TRACE=1`
+   (on by default in this phase), every AT line. A healthy boot ends with `UPLINK: status {...}` →
+   `MQTT: PUBACK ...` → `LIFE: MQTT -> ONLINE (boot delivered)`.
+
+## Tests
+
+The pure logic in `lib/core` runs on the laptop:
+
+```sh
+pio test -e native
+```
+
+On macOS, if this fails with `'cstddef' file not found`, the Command Line Tools install is damaged:
+`/Library/Developer/CommandLineTools/usr/include/c++/v1` holds a few leftover files that hide the SDK's libc++
+headers. Reinstall the tools (`sudo rm -rf /Library/Developer/CommandLineTools && xcode-select --install`).
+Until then, run the tests with the SDK headers added explicitly:
+
+```sh
+PLATFORMIO_BUILD_FLAGS="-isystem $(xcrun --show-sdk-path)/usr/include/c++/v1" pio test -e native
+```
+
 ## Hardware roadmap
 
 ### Current version (this firmware)

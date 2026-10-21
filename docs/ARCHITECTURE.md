@@ -60,7 +60,8 @@ Dependency rule: a layer calls only the layers **below** it. `core/` depends on 
 
 | Module | Responsibility |
 |---|---|
-| `A7670Modem` | **Sole owner of `SerialAT`.** Wraps TinyGSM for power on/off, SIM, registration, RSSI, `AT+CCLK`, DTR sleep (`AT+CSCLK=1`) and certificate upload. Runs a URC dispatcher so asynchronous lines (`+CMQTTPUB:`, `+CMQTTRXSTART…`, `+CMQTTCONNLOST:`, `RING`) reach their subscribers and aren't swallowed. |
+| `AtChannel` | **Sole reader and writer of `SerialAT`.** A line-based AT engine: `exec` / `query` / `sendData` (for `>` prompts), plus `waitFor` for asynchronous results. Every line that isn't the answer to the current command goes to the registered `UrcListener`s instead of being dropped. Asynchronous lines such as `+CMQTTPUB:`, `+CMQTTRXSTART…`, `+CMQTTCONNLOST:` and `RING` therefore always reach their owner. With `AT_TRACE` it logs every line, but never certificate or payload bytes. Replaces TinyGSM (D6). |
+| `A7670Modem` | Power on/off and reset, SIM, registration, data bearer, RSSI, NTP time (`AT+CNTP`, read back with `AT+CCLK`), the certificate store (`AT+CCERTDOWN` / `AT+CCERTLIST`), and DTR sleep (`AT+CSCLK=1`, P3). Built on `AtChannel`. |
 | `GnssSource` (interface) | `powerOn(hot)`, `powerOff(keepBackup)`, `poll() -> optional<Fix>`. The implementation is **`ModemGnss`**, using the A7670E-FASE's built-in GNSS through the shared AT channel: `AT+CGNSSPWR`, `AT+CGNSSMODE` and `AT+CGNSSINFO`. Not `AT+CGPS`, which is a SIM7600 command and returns `ERROR` on the A7670. An **active** GNSS antenna is required on the modem's GNSS IPEX connector. The interface stays in place so a future board can use an external module. |
 | `MotionSensor` (interface) | `arm(thresholdMg)`, `irqPin()`, `sampleMagnitudeMg()`. **v1 uses only `NoMotionSensor`**, which reports "always moving" so the device tracks continuously. A real accelerometer arrives in the next hardware version (see README). |
 | `BusVoltage` (interface) | `readVolts()`. `AdcBusVoltage` reads a resistor divider on an ADC1 pin (ADC2 is unusable while the radio is active); README → Hardware roadmap has the recommended divider. `FixedBusVoltage` is for the bench. |
@@ -71,8 +72,8 @@ Dependency rule: a layer calls only the layers **below** it. `core/` depends on 
 | Module | Responsibility |
 |---|---|
 | `NetworkLink` | Registration and PDP context, with retry and backoff. Exposes `isUp()` and `rssiDbm()`. |
-| `MqttSession` | **Our own thin layer over `AT+CMQTT*`**. TinyGSM's `mqtt_publish()` returns on `OK`, which only means the modem queued the publish. PUBACK arrives later as the `+CMQTTPUB: <idx>,0` URC, and `MqttSession` waits for that URC before reporting a publish as delivered. It also handles TLS setup, CONNECT with client ID = thing name, SUBSCRIBE to `cmd` (QoS 1), connection-lost URCs and reconnects. API: `publish(topic, payload, timeout) -> Delivered / Failed / LinkLost`. |
-| `ClockService` | Keeps UTC epoch milliseconds. Source order: GNSS time > network time (`AT+CCLK`, NITZ) > none. It anchors `millis()` to the last good sync and carries the anchor across deep sleep via RTC memory plus the sleep duration. `isSet()` applies the protocol's rule (≥ 2020-01-01). **No publish happens while `!isSet()`.** |
+| `MqttSession` | **Our own thin layer over `AT+CMQTT*`**. `AT+CMQTTPUB` returns `OK`, which only means the modem queued the publish. PUBACK arrives later as the `+CMQTTPUB: <idx>,0` URC, and `MqttSession` waits for that URC before reporting a publish as delivered. It also handles TLS setup, CONNECT with client ID = thing name, SUBSCRIBE to `cmd` (QoS 1), connection-lost URCs and reconnects. API: `publish(topic, payload, timeout) -> Delivered / Failed / LinkLost`. |
+| `ClockService` | Keeps UTC epoch milliseconds. **Unset until a trusted source sets it**: NTP when the link comes up, GNSS when there is a fix (P2). The modem RTC and network time (NITZ) are never trusted on their own, because after power-up the RTC reads `70/01/01`. It anchors `millis()` to the last good sync and carries the anchor across deep sleep via RTC memory plus the sleep duration. `isSet()` is false until then. **No publish happens while `!isSet()`.** |
 | `PositionService` | Drives the `GnssSource` per mode (hot/cold budget, continuous NAV, backup between fixes) and rejects invalid fixes (no lock, `0,0`, out of range, timestamp before the clock was set). It also feeds GNSS time into `ClockService`. |
 | `Uplink` | Takes batches from `FixOutbox` through `BatchPlanner`, encodes them with `ProtocolEncoder`, publishes via `MqttSession`, and acks the outbox **only** on `Delivered`. It also sends `status` events. Owns `seq`. |
 | `CommandService` | Turns commands from two sources into `LifecycleEvent`s (`PursuitRequested`, `ConfigChanged`). The sources are the **MQTT `cmd` topic** while connected (dedupe on `commandId`) and **SMS / voice call** while parked (§4.1). Unknown commands are ignored, as the protocol requires. |
@@ -87,8 +88,8 @@ Dependency rule: a layer calls only the layers **below** it. `core/` depends on 
 | `LifecyclePolicy` | **The state machine as a pure function**: `next(state, inputs) -> {state, actions[], reason}`. The inputs are a snapshot (tier, charging, moving, idleFor, fixValid, timers, pendingCommand). Every row of the lifecycle rule table becomes a unit test. |
 | `FixOutbox` | A ring buffer of compact fixes (~20 B each: ts ms, lat/lon int32 1e-7°, alt dm, spd, crs, sat, hdop). Uses `peekOldest(n)`, then `ack(n)` or no-op on failure, so nothing is lost before PUBACK. When full it drops the oldest and counts the drops. |
 | `BatchPlanner` | Decides when to publish (publish interval elapsed, ≥ N fixes queued, final report, backlog drain) and how many fixes go in a message (≤ 100, payload ≤ the modem's 10 KB `CMQTTPAYLOAD` limit). |
-| `ProtocolEncoder` | Builds the `telemetry` / `status` JSON into a caller-supplied buffer with `snprintf`, with no heap and no ArduinoJson needed. It omits absent optional fields (never `null`) and emits 6-decimal lat/lon. |
-| `CommandParser` | Minimal JSON reader for the reserved `cmd` shape: `v`, `commandId`, `command`, `arguments`. |
+| `ProtocolEncoder` | Builds the `telemetry` / `status` JSON with ArduinoJson into a caller-supplied buffer. It writes the payload only if it fits whole, never truncated. It omits absent optional fields (never `null`), rounds lat/lon to 6 decimals and `batV` to 2, and refuses NaN values and timestamps before 2020. |
+| `CommandParser` | Reads the reserved `cmd` shape (`v`, `commandId`, `command`, `arguments`) with ArduinoJson `deserializeJson`. |
 
 ### 2.5 app/
 
@@ -104,7 +105,7 @@ Dependency rule: a layer calls only the layers **below** it. `core/` depends on 
 **One cooperative super-loop.** No application FreeRTOS tasks.
 
 - The AT channel is a single serial pipe, so a single owner (`A7670Modem`) removes a whole class of interleaving bugs.
-- Each service exposes `tick(nowMs)`. Blocking calls (TinyGSM waits, `CMQTTPUB` → PUBACK) always take explicit timeouts no longer than the 30 s watchdog.
+- Each service exposes `tick(nowMs)`. Blocking calls (AT replies, `CMQTTPUB` → PUBACK) always take explicit timeouts, and every wait loop feeds the 30 s watchdog.
 - URCs are drained in `A7670Modem::tick()` and also inside every wait loop, then dispatched to their subscribers. This is how PUBACK and `cmd` messages arrive.
 - Task watchdog enabled. A hang means a reset, and the reset reason is logged in the next `boot` event.
 
@@ -243,13 +244,13 @@ Conversions happen in one place, `ClockMath` (`toWireMs(uint32 s)`, `toStoreS(in
 ```
 include/utilities.h          (LilyGO pin map, unchanged; included only by platform/Board)
 lib/core/                    pure C++17, no Arduino; built for both esp32 and native
-  Config.h  PowerPolicy.*  MotionFilter.*  LifecyclePolicy.*
-  FixOutbox.*  BatchPlanner.*  ProtocolEncoder.*  CommandParser.*  ClockMath.*  Types.h
+  P1: ProtocolTypes.h  ProtocolEncoder.*  ClockMath.*  AtParse.*  Topics.*
+  later: Config.h  PowerPolicy.*  MotionFilter.*  LifecyclePolicy.*  FixOutbox.*  BatchPlanner.*  CommandParser.*
 src/
   main.cpp
   app/Lifecycle.*
   services/NetworkLink.*  MqttSession.*  ClockService.*  PositionService.*  Uplink.*  CommandService.*
-  drivers/A7670Modem.*  gnss/{GnssSource.h, ModemGnss.*}
+  drivers/AtChannel.*  A7670Modem.*  gnss/{GnssSource.h, ModemGnss.*}
           motion/{MotionSensor.h, NoMotionSensor.*}  power/{BusVoltage.h, LoadSwitch.h, …}
   platform/Board.*  Sleep.*  RtcStore.*  NvsStore.*  Log.*
 test/
@@ -285,3 +286,5 @@ The hardware the lifecycle doc assumes doesn't exist on the bench yet (accelerom
 | D3 | Accelerometer | Not in this firmware version. `NoMotionSensor` is used, and the real sensor comes in the next hardware version. |
 | D4 | Remote wake while parked | SMS or voice call (RING pin), not MQTT keepalive. |
 | D5 | Time units | Milliseconds on the wire and in memory, seconds in storage (§7). |
+| D6 | AT layer | Own `AtChannel` instead of TinyGSM. TinyGSM's `waitResponse` discards every line it isn't waiting for (`### Unhandled`), which would silently eat PUBACKs, connection-lost notices and RING/SMS. TinyGSM, StreamDebugger and TinyGPSPlus are removed from `lib_deps`. |
+| D7 | JSON library | ArduinoJson 7 for both encoding and parsing, rather than a hand-written writer plus jsmn. Its documents live on the heap (about 10 KB for a full telemetry batch), which the ESP32 can afford. It is built with `ARDUINOJSON_USE_LONG_LONG=1` so the int64 `ts` survives on the 32-bit MCU, and a unit test guards this. |
