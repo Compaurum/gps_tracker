@@ -39,6 +39,10 @@ public:
     // Sends "AT<fmt...>\r" and waits for OK / ERROR / +CME ERROR.
     AtResult exec(uint32_t timeoutMs, const char* fmt, ...) __attribute__((format(printf, 3, 4)));
 
+    // Sends a bare "AT" and waits for OK, to find out whether the modem is on. Unlike exec, a
+    // timeout here is expected (modem off) and does not wait for a late result.
+    bool probe(uint32_t timeoutMs);
+
     // Like exec, and copies the last line starting with `prefix` (e.g. "+CSQ:") into `out`.
     AtResult query(uint32_t timeoutMs, const char* prefix, char* out, size_t cap, const char* fmt, ...)
         __attribute__((format(printf, 6, 7)));
@@ -69,9 +73,12 @@ public:
 private:
     enum class Read { Line, Prompt, Timeout };
 
+    // After a timeout: wait a while for the late final result and discard it, so it can't be
+    // taken as the answer to the next command.
+    void discardLateResult(const char* cmd);
     AtResult run(uint32_t timeoutMs, const char* prefix, LineFn fn, void* ctx, const void* data, size_t len,
-                 const char* fmt, va_list args);
-    void sendCommand(const char* fmt, va_list args);
+                 bool waitLate, const char* fmt, va_list args);
+    AtResult runf(uint32_t timeoutMs, bool waitLate, const char* fmt, ...) __attribute__((format(printf, 4, 5)));
     // Reads one line into line_. `promptOk` lets a bare '>' at line start count as a prompt.
     Read readInto(uint32_t timeoutMs, bool promptOk);
     // Non-blocking variant: consumes available bytes, true once a full line is in line_.

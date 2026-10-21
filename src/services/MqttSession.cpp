@@ -12,11 +12,23 @@ namespace services {
 
 static const char* const TAG = "MQTT";
 
+// Rule for every wait below: outlast the modem's own timeout, so the modem always answers before
+// we give up. Otherwise its late OK/ERROR could be read as the answer to the next command.
+// The A7670 (A011B07) holds back the OK of network commands until the network has answered.
+
 // Seconds the modem waits for a PUBACK before reporting failure (A7670 accepts 60-180).
 static constexpr uint32_t kModemPubTimeoutS = 60;
+static constexpr uint32_t kPubCommandTimeoutMs = kModemPubTimeoutS * 1000 + 10000;
+// Seconds the modem waits for the broker during a disconnect (A7670 accepts 0-180).
+static constexpr uint32_t kModemDiscTimeoutS = 10;
+static constexpr uint32_t kDiscTimeoutMs = kModemDiscTimeoutS * 1000 + 10000;
+// TCP + TLS handshake; ~6 s at good signal when roaming, much longer on a weak link or 2G.
+static constexpr uint32_t kConnectTimeoutMs = 60000;
+static constexpr uint32_t kSubscribeTimeoutMs = 30000;
+// Local-only commands (no network round trip).
+static constexpr uint32_t kLocalTimeoutMs = 10000;
 // The modem's own per-publish limit for +CMQTTPAYLOAD.
 static constexpr size_t kMaxPayload = 10240;
-static constexpr uint32_t kConnectTimeoutMs = 60000;
 
 const char* publishResultName(PublishResult r) {
     switch (r) {
@@ -39,9 +51,13 @@ void MqttSession::setMessageHandler(MessageFn fn, void* ctx) {
 void MqttSession::releaseClient() {
     // Tear down whatever a previous run left in the modem; every step may fail harmlessly.
     char line[48];
-    if (at_.exec(5000, "+CMQTTDISC=0,60") == AtResult::Ok) at_.waitFor("+CMQTTDISC:", line, sizeof(line), 5000);
-    at_.exec(3000, "+CMQTTREL=0");
-    if (at_.exec(3000, "+CMQTTSTOP") == AtResult::Ok) at_.waitFor("+CMQTTSTOP:", line, sizeof(line), 5000);
+    if (at_.exec(kDiscTimeoutMs, "+CMQTTDISC=0,%u", static_cast<unsigned>(kModemDiscTimeoutS)) == AtResult::Ok) {
+        at_.waitFor("+CMQTTDISC:", line, sizeof(line), kDiscTimeoutMs);
+    }
+    at_.exec(kLocalTimeoutMs, "+CMQTTREL=0");
+    if (at_.exec(kLocalTimeoutMs, "+CMQTTSTOP") == AtResult::Ok) {
+        at_.waitFor("+CMQTTSTOP:", line, sizeof(line), kLocalTimeoutMs);
+    }
 }
 
 bool MqttSession::configureTls() {
@@ -89,8 +105,10 @@ bool MqttSession::connect() {
     if (at_.exec(3000, "+CMQTTCFG=\"version\",0,4") != AtResult::Ok) return false;
 
     // Clean session 1: nothing is queued for the device on the broker today.
-    // A quick refusal arrives as "+CMQTTCONNECT: 0,<err>" followed by ERROR; keep the line for the log.
-    if (at_.query(5000, "+CMQTTCONNECT:", line, sizeof(line), "+CMQTTCONNECT=0,\"tcp://%s:%u\",%u,1", cfg_.host,
+    // The A7670 (A011B07) holds the OK until the TCP + TLS handshake is done (~6 s when roaming), so
+    // the command itself gets the full connect timeout. A quick refusal arrives as
+    // "+CMQTTCONNECT: 0,<err>" followed by ERROR; keep the line for the log.
+    if (at_.query(kConnectTimeoutMs, "+CMQTTCONNECT:", line, sizeof(line), "+CMQTTCONNECT=0,\"tcp://%s:%u\",%u,1", cfg_.host,
                   cfg_.port, cfg_.keepaliveS) != AtResult::Ok) {
         // Codes are in the SIMCom A76XX MQTT(S) application note.
         LOGE(TAG, "connect refused: %s", line[0] ? line : "no result code");
@@ -115,12 +133,12 @@ bool MqttSession::connect() {
 bool MqttSession::subscribe(const char* topic) {
     if (!connected_) return false;
     // QoS 1, per the protocol.
-    if (at_.sendData(5000, topic, strlen(topic), "+CMQTTSUB=0,%u,1", static_cast<unsigned>(strlen(topic))) !=
-        AtResult::Ok) {
+    const unsigned len = static_cast<unsigned>(strlen(topic));
+    if (at_.sendData(kSubscribeTimeoutMs, topic, len, "+CMQTTSUB=0,%u,1", len) != AtResult::Ok) {
         return false;
     }
     char line[48];
-    if (!at_.waitFor("+CMQTTSUB:", line, sizeof(line), 10000)) {
+    if (!at_.waitFor("+CMQTTSUB:", line, sizeof(line), kSubscribeTimeoutMs)) {
         LOGE(TAG, "subscribe %s: no SUBACK", topic);
         return false;
     }
@@ -136,8 +154,10 @@ bool MqttSession::subscribe(const char* topic) {
 bool MqttSession::sendTopicAndPayload(const char* topic, const char* payload) {
     const size_t tlen = strlen(topic);
     const size_t plen = strlen(payload);
-    return at_.sendData(5000, topic, tlen, "+CMQTTTOPIC=0,%u", static_cast<unsigned>(tlen)) == AtResult::Ok &&
-           at_.sendData(10000, payload, plen, "+CMQTTPAYLOAD=0,%u", static_cast<unsigned>(plen)) == AtResult::Ok;
+    // Both only fill the modem's buffers; no network round trip.
+    return at_.sendData(kLocalTimeoutMs, topic, tlen, "+CMQTTTOPIC=0,%u", static_cast<unsigned>(tlen)) ==
+               AtResult::Ok &&
+           at_.sendData(kLocalTimeoutMs, payload, plen, "+CMQTTPAYLOAD=0,%u", static_cast<unsigned>(plen)) == AtResult::Ok;
 }
 
 PublishResult MqttSession::publish(const char* topic, const char* payload, uint32_t timeoutMs) {
@@ -149,7 +169,8 @@ PublishResult MqttSession::publish(const char* topic, const char* payload, uint3
     }
     const uint32_t start = millis();
     if (!sendTopicAndPayload(topic, payload)) return connected_ ? PublishResult::Failed : PublishResult::LinkLost;
-    if (at_.exec(5000, "+CMQTTPUB=0,1,%u", static_cast<unsigned>(kModemPubTimeoutS)) != AtResult::Ok) {
+    if (at_.exec(kPubCommandTimeoutMs, "+CMQTTPUB=0,1,%u", static_cast<unsigned>(kModemPubTimeoutS)) !=
+        AtResult::Ok) {
         return connected_ ? PublishResult::Failed : PublishResult::LinkLost;
     }
 
@@ -194,9 +215,10 @@ bool MqttSession::onUrc(const char* line) {
         receiveMessage(line);
         return true;
     }
-    if (core::startsWith(line, "+CMQTTPUB:")) {
-        // Arrived after publish() stopped waiting.
-        LOGW(TAG, "late publish result: %s", line);
+    // Results that arrived after the caller stopped waiting.
+    if (core::startsWith(line, "+CMQTTPUB:") || core::startsWith(line, "+CMQTTCONNECT:") ||
+        core::startsWith(line, "+CMQTTSUB:")) {
+        LOGW(TAG, "late result ignored: %s", line);
         return true;
     }
     // Late results of teardown commands.

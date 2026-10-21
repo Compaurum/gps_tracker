@@ -13,6 +13,8 @@ static const char* const TAG = "AT";
 
 // Longest command we send is CMQTTCONNECT with the endpoint host (~90 chars).
 static constexpr size_t kMaxCommand = 192;
+// How long to wait for a late final result after a command timed out.
+static constexpr uint32_t kLateResultGraceMs = 10000;
 
 const char* atResultName(AtResult r) {
     switch (r) {
@@ -36,7 +38,7 @@ void AtChannel::addListener(UrcListener* listener) {
 AtResult AtChannel::exec(uint32_t timeoutMs, const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
-    AtResult r = run(timeoutMs, nullptr, nullptr, nullptr, nullptr, 0, fmt, args);
+    AtResult r = run(timeoutMs, nullptr, nullptr, nullptr, nullptr, 0, true, fmt, args);
     va_end(args);
     return r;
 }
@@ -57,7 +59,7 @@ AtResult AtChannel::query(uint32_t timeoutMs, const char* prefix, char* out, siz
     CopyTarget target{out, cap};
     va_list args;
     va_start(args, fmt);
-    AtResult r = run(timeoutMs, prefix, copyLine, &target, nullptr, 0, fmt, args);
+    AtResult r = run(timeoutMs, prefix, copyLine, &target, nullptr, 0, true, fmt, args);
     va_end(args);
     return r;
 }
@@ -65,7 +67,7 @@ AtResult AtChannel::query(uint32_t timeoutMs, const char* prefix, char* out, siz
 AtResult AtChannel::queryLines(uint32_t timeoutMs, const char* prefix, LineFn fn, void* ctx, const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
-    AtResult r = run(timeoutMs, prefix, fn, ctx, nullptr, 0, fmt, args);
+    AtResult r = run(timeoutMs, prefix, fn, ctx, nullptr, 0, true, fmt, args);
     va_end(args);
     return r;
 }
@@ -73,13 +75,25 @@ AtResult AtChannel::queryLines(uint32_t timeoutMs, const char* prefix, LineFn fn
 AtResult AtChannel::sendData(uint32_t timeoutMs, const void* data, size_t len, const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
-    AtResult r = run(timeoutMs, nullptr, nullptr, nullptr, data, len, fmt, args);
+    AtResult r = run(timeoutMs, nullptr, nullptr, nullptr, data, len, true, fmt, args);
+    va_end(args);
+    return r;
+}
+
+bool AtChannel::probe(uint32_t timeoutMs) {
+    return runf(timeoutMs, false, "%s", "") == AtResult::Ok;
+}
+
+AtResult AtChannel::runf(uint32_t timeoutMs, bool waitLate, const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    AtResult r = run(timeoutMs, nullptr, nullptr, nullptr, nullptr, 0, waitLate, fmt, args);
     va_end(args);
     return r;
 }
 
 AtResult AtChannel::run(uint32_t timeoutMs, const char* prefix, LineFn fn, void* ctx, const void* data, size_t len,
-                        const char* fmt, va_list args) {
+                        bool waitLate, const char* fmt, va_list args) {
     if (inCommand_) {
         // A URC listener tried to send a command mid-dispatch; the reply would be misattributed.
         LOGE(TAG, "nested command refused");
@@ -131,9 +145,30 @@ AtResult AtChannel::run(uint32_t timeoutMs, const char* prefix, LineFn fn, void*
         if (strcmp(line_, cmd) == 0) continue;  // command echo, before ATE0 takes effect
         dispatch(line_);
     }
-    if (result == AtResult::Timeout) LOGW(TAG, "%s -> timeout after %lu ms", cmd, static_cast<unsigned long>(timeoutMs));
+    if (result == AtResult::Timeout && waitLate) {
+        LOGW(TAG, "%s -> timeout after %lu ms", cmd, static_cast<unsigned long>(timeoutMs));
+        discardLateResult(cmd);
+    }
     inCommand_ = false;
     return result;
+}
+
+void AtChannel::discardLateResult(const char* cmd) {
+    const uint32_t start = millis();
+    for (;;) {
+        const uint32_t elapsed = millis() - start;
+        if (elapsed >= kLateResultGraceMs) {
+            LOGW(TAG, "%s: no late result within %lu ms", cmd, static_cast<unsigned long>(kLateResultGraceMs));
+            return;
+        }
+        if (readInto(kLateResultGraceMs - elapsed, false) == Read::Timeout) continue;
+        if (strcmp(line_, "OK") == 0 || isFinalError(line_)) {
+            LOGW(TAG, "%s: late result '%s' discarded after %lu ms", cmd, line_,
+                 static_cast<unsigned long>(millis() - start));
+            return;
+        }
+        dispatch(line_);
+    }
 }
 
 bool AtChannel::waitFor(const char* prefix, char* out, size_t cap, uint32_t timeoutMs) {

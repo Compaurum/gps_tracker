@@ -18,7 +18,7 @@ A7670Modem::A7670Modem(AtChannel& at) : at_(at) {
 
 bool A7670Modem::probe(uint32_t attempts) {
     for (uint32_t i = 0; i < attempts; ++i) {
-        if (at_.exec(500, "%s", "") == AtResult::Ok) return true;
+        if (at_.probe(500)) return true;
     }
     return false;
 }
@@ -35,7 +35,7 @@ bool A7670Modem::powerOn() {
         for (int round = 0; round < 3 && !up; ++round) {
             const uint32_t roundStart = millis();
             while (millis() - roundStart < 15000) {
-                if (at_.exec(500, "%s", "") == AtResult::Ok) {
+                if (at_.probe(500)) {
                     up = true;
                     break;
                 }
