@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 // Build-time device configuration. DEVICE_ID, MQTT_HOST and CELL_APN come from secrets.ini
@@ -16,7 +17,9 @@ constexpr const char* kFwVersion = FW_VERSION;
 constexpr const char* kHwModel = "lilygo-t-call-a7670";
 
 constexpr uint16_t kMqttKeepaliveS = 60;
-constexpr const char* kNtpServer = "pool.ntp.org";
+// Tried in order within one clock attempt.
+constexpr const char* kNtpServers[] = {"au.pool.ntp.org", "time.google.com", "pool.ntp.org"};
+constexpr size_t kNtpServerCount = sizeof(kNtpServers) / sizeof(kNtpServers[0]);
 
 // File names in the modem's certificate store, written once by the provision env.
 constexpr const char* kCaCertFile = "aws_root_ca.pem";

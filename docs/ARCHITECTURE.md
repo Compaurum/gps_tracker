@@ -71,10 +71,10 @@ Dependency rule: a layer calls only the layers **below** it. `core/` depends on 
 
 | Module | Responsibility |
 |---|---|
-| `NetworkLink` | Registration and PDP context, with retry and backoff. Exposes `isUp()` and `rssiDbm()`. |
+| `NetworkLink` | SIM, registration and PDP context. It's **polled** (`begin` / `poll` → Pending / Up / Failed, at most one check per second) rather than blocking, so GNSS sampling continues while the modem searches for a network. `Lifecycle` owns retry and backoff. |
 | `MqttSession` | **Our own thin layer over `AT+CMQTT*`**. `AT+CMQTTPUB` returns `OK`, which only means the modem queued the publish. PUBACK arrives later as the `+CMQTTPUB: <idx>,0` URC, and `MqttSession` waits for that URC before reporting a publish as delivered. It also handles TLS setup, CONNECT with client ID = thing name, SUBSCRIBE to `cmd` (QoS 1), connection-lost URCs and reconnects. API: `publish(topic, payload, timeout) -> Delivered / Failed / LinkLost`. |
 | `ClockService` | Keeps UTC epoch milliseconds. **Unset until a trusted source sets it**: NTP when the link comes up, GNSS when there is a fix (P2). The modem RTC and network time (NITZ) are never trusted on their own, because after power-up the RTC reads `70/01/01`. It anchors `millis()` to the last good sync and carries the anchor across deep sleep via RTC memory plus the sleep duration. `isSet()` is false until then. **No publish happens while `!isSet()`.** |
-| `PositionService` | Drives the `GnssSource` per mode (hot/cold budget, continuous NAV, backup between fixes) and rejects invalid fixes (no lock, `0,0`, out of range, timestamp before the clock was set). It also feeds GNSS time into `ClockService`. |
+| `PositionService` | Samples the `GnssSource` every `sampleIntervalMs` and turns readings into protocol fixes with `fixFromReading`, rejecting no lock, `0,0`, out-of-range values and timestamps before 2020. It sets and re-anchors `ClockService` from GNSS time every 10 min, and re-powers the receiver if it went away. P3 adds per-state modes (hot/cold budget, backup between fixes). |
 | `Uplink` | Takes batches from `FixOutbox` through `BatchPlanner`, encodes them with `ProtocolEncoder`, publishes via `MqttSession`, and acks the outbox **only** on `Delivered`. It also sends `status` events. Owns `seq`. |
 | `CommandService` | Turns commands from two sources into `LifecycleEvent`s (`PursuitRequested`, `ConfigChanged`). The sources are the **MQTT `cmd` topic** while connected (dedupe on `commandId`) and **SMS / voice call** while parked (§4.1). Unknown commands are ignored, as the protocol requires. |
 
@@ -84,10 +84,13 @@ Dependency rule: a layer calls only the layers **below** it. `core/` depends on 
 |---|---|
 | `Config` | All tunables in one struct. Compile-time defaults, overridable from NVS, and from `set_interval` later. See §6. |
 | `PowerPolicy` | Volts → tier `OK / LOW / CRITICAL`, with hysteresis (OK↔LOW at 12.0 V falling / 12.2 V rising), crank debounce (CRITICAL only if low for > 2 s) and charging detection (≥ 13.2 V). |
-| `MotionFilter` | Debounce: sustained ≥ 0.3 g for ≥ 200 ms counts as motion. Idle timers (idle ≥ 2 min, idle ≥ 5 min). |
+| `FixQuality` | Rates each fix **good** (≤ 25 m), **fair** (≤ 100 m) or **poor**, using the receiver's own error estimate (NMEA `GST`, metres at 1σ). Without `GST` the estimate is HDOP × 10 m, capped at fair, because HDOP ignores multipath (D9). |
+| `MotionDetector` | **This hardware version (D8):** motion from **distance**, not speed. Two usable fixes in a row more than 150 m (or 2 × their error) from the parking anchor mean moving, as do two good fixes at ≥ 10 km/h. No progress beyond that radius for 5 min means stationary. Poor fixes are ignored. |
+| `NmeaAssembler` | Builds one reading per receiver epoch from checksummed `RMC` + `GGA` + `GST` sentences with matching UTC time. |
+| `MotionFilter` | **Next hardware version:** accelerometer debounce, where sustained ≥ 0.3 g for ≥ 200 ms counts as motion. It feeds the same moving/stationary decision. |
 | `LifecyclePolicy` | **The state machine as a pure function**: `next(state, inputs) -> {state, actions[], reason}`. The inputs are a snapshot (tier, charging, moving, idleFor, fixValid, timers, pendingCommand). Every row of the lifecycle rule table becomes a unit test. |
-| `FixOutbox` | A ring buffer of compact fixes (~20 B each: ts ms, lat/lon int32 1e-7°, alt dm, spd, crs, sat, hdop). Uses `peekOldest(n)`, then `ack(n)` or no-op on failure, so nothing is lost before PUBACK. When full it drops the oldest and counts the drops. |
-| `BatchPlanner` | Decides when to publish (publish interval elapsed, ≥ N fixes queued, final report, backlog drain) and how many fixes go in a message (≤ 100, payload ≤ the modem's 10 KB `CMQTTPAYLOAD` limit). |
+| `FixOutbox` | A ring buffer of compact fixes (`core::Fix`, 24 B: ts in seconds, lat/lon int32 1e-7°, alt m, spd, crs, sat, hdop, plus presence flags). Uses `peekOldest(n, &firstId)`, then `ack(firstId, n)` only on PUBACK, so nothing is lost before delivery. Running ids mean an ack removes exactly the fixes that were sent, even if some were dropped for space meanwhile. When full it drops the oldest and counts the drops. P2 keeps 8,640 fixes (24 h at 10 s) in PSRAM. |
+| `BatchPlanner` | `planReport()` decides what to publish next. Rules, in order: back off 30 s after a failure; a full message's worth queued → telemetry now (backlog drain); fixes queued and (flush requested, first publish, or 60 s elapsed) → telemetry; nothing delivered for 15 min → heartbeat. `Uplink` picks the batch size: up to 100 fixes, shed 10% at a time until the payload fits the modem's 10,240 bytes. 100 full fixes are 10,336 bytes. |
 | `ProtocolEncoder` | Builds the `telemetry` / `status` JSON with ArduinoJson into a caller-supplied buffer. It writes the payload only if it fits whole, never truncated. It omits absent optional fields (never `null`), rounds lat/lon to 6 decimals and `batV` to 2, and refuses NaN values and timestamps before 2020. |
 | `CommandParser` | Reads the reserved `cmd` shape (`v`, `commandId`, `command`, `arguments`) with ArduinoJson `deserializeJson`. |
 
@@ -96,6 +99,7 @@ Dependency rule: a layer calls only the layers **below** it. `core/` depends on 
 | Module | Responsibility |
 |---|---|
 | `Lifecycle` | The runner. Each iteration it collects inputs from the services, calls `LifecyclePolicy::next`, executes the returned actions, logs `LIFE: TRACK_ACTIVE -> PURSUIT (reason: not charging, moving)`, and persists the state that needs persisting. |
+| `Tracking` | The P2 data flow: GNSS sample → `FixQuality` → `MotionDetector` → `FixOutbox` → `planReport` → telemetry or heartbeat via `Uplink`. `Lifecycle` calls `sample()` whenever the modem is up (also offline, so fixes collect for store-and-forward) and `report()` only while ONLINE. |
 | `main.cpp` | Wiring only: builds the concrete drivers for this board, injects them, runs `Lifecycle`. Roughly 50 lines. |
 
 ---
@@ -244,11 +248,12 @@ Conversions happen in one place, `ClockMath` (`toWireMs(uint32 s)`, `toStoreS(in
 ```
 include/utilities.h          (LilyGO pin map, unchanged; included only by platform/Board)
 lib/core/                    pure C++17, no Arduino; built for both esp32 and native
-  P1: ProtocolTypes.h  ProtocolEncoder.*  ClockMath.*  AtParse.*  Topics.*
-  later: Config.h  PowerPolicy.*  MotionFilter.*  LifecyclePolicy.*  FixOutbox.*  BatchPlanner.*  CommandParser.*
+  P1: ProtocolTypes.h  ProtocolEncoder.*  ClockMath.*  AtParse.*  Topics.*  Endpoint.*
+  P2: Config.h  Fix.*  FixQuality.*  Geo.*  Nmea.*  GnssParse.*  FixOutbox.*  MotionDetector.*  BatchPlanner.*
+  later: PowerPolicy.*  MotionFilter.*  LifecyclePolicy.*  CommandParser.*
 src/
   main.cpp
-  app/Lifecycle.*
+  app/Lifecycle.*  Tracking.*
   services/NetworkLink.*  MqttSession.*  ClockService.*  PositionService.*  Uplink.*  CommandService.*
   drivers/AtChannel.*  A7670Modem.*  gnss/{GnssSource.h, ModemGnss.*}
           motion/{MotionSensor.h, NoMotionSensor.*}  power/{BusVoltage.h, LoadSwitch.h, …}
@@ -288,3 +293,6 @@ The hardware the lifecycle doc assumes doesn't exist on the bench yet (accelerom
 | D5 | Time units | Milliseconds on the wire and in memory, seconds in storage (§7). |
 | D6 | AT layer | Own `AtChannel` instead of TinyGSM. TinyGSM's `waitResponse` discards every line it isn't waiting for (`### Unhandled`), which would silently eat PUBACKs, connection-lost notices and RING/SMS. TinyGSM, StreamDebugger and TinyGPSPlus are removed from `lib_deps`. |
 | D7 | JSON library | ArduinoJson 7 for both encoding and parsing, rather than a hand-written writer plus jsmn. Its documents live on the heap (about 10 KB for a full telemetry batch), which the ESP32 can afford. It is built with `ARDUINOJSON_USE_LONG_LONG=1` so the int64 `ts` survives on the 32-bit MCU, and a unit test guards this. |
+| D8 | Motion without an accelerometer | Moving/stationary comes from distance travelled (`MotionDetector`). Speed is used only from good fixes. A first version that used GPS speed alone flipped to "moving" next to a window, where multipath produced 26 km/h readings and ~90 m jumps at HDOP 1.6–2.1. Telemetry goes out only while moving, plus the first fix after boot and the fix that ends a ride; while stationary only the 15-min heartbeat. Poor fixes are never sent. The accelerometer replaces this in the next hardware version. |
+| D9 | GNSS source format and accuracy | NMEA (`AT+CGNSSTST=1`: `RMC`, `GGA`, `GST`) instead of `AT+CGNSSINFO`. This modem firmware (A011B07) cuts `CGNSSINFO` at 98 characters, which loses HDOP and then speed at riding speeds; NMEA lines are short and checksummed. `GST` gives the receiver's own error estimate, which is sent per fix as `acc` (metres; not in protocol v1, so the backend ignores it until `PROTOCOL.md` adds it). `CGNSSINFO` stays as a fallback if no NMEA arrives. Constellations: `CGNSSMODE=4` (GPS + BeiDou + Galileo). Assisted GPS (`AT+CAGPS`) runs once per boot after the link is up, if there is no lock yet. |
+| D10 | Accelerometer and its pins | ADXL345 (I²C, activity interrupt on INT1). All six wires on the right-hand header so the soldering is on one side: 3V3, GND, I²C on GPIO32 (SDA) / GPIO33 (SCL), INT1/INT2 on GPIO34/GPIO35. 34/35 are input-only, so they can carry interrupts (and `ext1` wake) but not I²C. This moves the bus-voltage divider from 34/35 to GPIO36 or GPIO39. Pin map in README → Hardware roadmap. |

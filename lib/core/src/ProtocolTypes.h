@@ -25,4 +25,12 @@ struct StatusMessage {
     const char* resetReason = nullptr;
 };
 
+// Envelope of a telemetry message; the fixes are passed separately (see encodeTelemetry).
+struct TelemetryMessage {
+    int64_t tsMs = 0;  // when the message was created and batV / rssi measured
+    std::optional<uint32_t> seq;
+    std::optional<float> batV;
+    std::optional<int> rssiDbm;
+};
+
 }  // namespace core

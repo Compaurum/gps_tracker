@@ -14,7 +14,8 @@ class ClockService {
 public:
     explicit ClockService(drivers::A7670Modem& modem);
 
-    bool syncFromNtp(const char* server);
+    // Tries each server in turn until one answers.
+    bool syncFromNtp(const char* const* servers, size_t count);
     // Sets the clock from any trusted source (GNSS in P2).
     void set(int64_t epochMs, const char* source);
 

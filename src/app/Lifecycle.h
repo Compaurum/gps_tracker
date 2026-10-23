@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 
+#include "Tracking.h"
 #include "drivers/A7670Modem.h"
 #include "services/ClockService.h"
 #include "services/MqttSession.h"
@@ -10,9 +11,10 @@
 
 namespace app {
 
-// P1 subset of the lifecycle (docs/ARCHITECTURE.md §4): bring the link up, send `boot` once
-// per power-up, stay connected, recover with backoff. The sleep/tracking states arrive with
-// LifecyclePolicy in P3; until then this is the connected-tracker skeleton.
+// The link state machine (docs/ARCHITECTURE.md §4, P1-P2 subset): bring the link up, send
+// `boot` once per power-up, stay connected, recover with backoff. Tracking (sampling, outbox,
+// reporting) runs alongside: sampling whenever the modem is up, reporting only while ONLINE.
+// The sleep states arrive with LifecyclePolicy in P3.
 class Lifecycle {
 public:
     struct Deps {
@@ -21,6 +23,7 @@ public:
         services::ClockService& clock;
         services::MqttSession& mqtt;
         services::Uplink& uplink;
+        Tracking& tracking;
     };
 
     explicit Lifecycle(const Deps& deps);
@@ -55,6 +58,8 @@ private:
     uint32_t lastHaltLogMs_ = 0;
     bool bootSent_ = false;
     bool certsChecked_ = false;
+    // The modem answers AT; GNSS sampling may run.
+    bool modemReady_ = false;
 };
 
 }  // namespace app

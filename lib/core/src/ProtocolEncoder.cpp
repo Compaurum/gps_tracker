@@ -51,4 +51,36 @@ size_t encodeStatus(const StatusMessage& msg, char* buf, size_t cap) {
     return serializeWhole(doc, buf, cap);
 }
 
+static constexpr size_t kMaxFixesPerMessage = 100;
+
+size_t encodeTelemetry(const TelemetryMessage& msg, const Fix* fixes, size_t n, char* buf, size_t cap) {
+    if (n < 1 || n > kMaxFixesPerMessage || !fixes) return 0;
+    if (msg.tsMs < kMinPlausibleEpochMs) return 0;
+    if (msg.batV && !std::isfinite(*msg.batV)) return 0;
+
+    JsonDocument doc;
+    doc["v"] = kProtocolVersion;
+    doc["ts"] = msg.tsMs;
+    if (msg.seq) doc["seq"] = *msg.seq;
+    JsonArray arr = doc["fixes"].to<JsonArray>();
+    for (size_t i = 0; i < n; ++i) {
+        const Fix& f = fixes[i];
+        JsonObject o = arr.add<JsonObject>();
+        o["ts"] = static_cast<int64_t>(f.tsS) * 1000;
+        // 6 decimals ≈ 0.1 m, as the protocol suggests.
+        o["lat"] = roundTo(f.latE7 / 1e7, 6);
+        o["lon"] = roundTo(f.lonE7 / 1e7, 6);
+        if (f.has(Fix::kAlt)) o["alt"] = f.altM;
+        if (f.has(Fix::kSpeed)) o["spd"] = roundTo(f.speedCkmh / 100.0, 1);
+        if (f.has(Fix::kCourse)) o["crs"] = roundTo(f.courseCdeg / 100.0, 1);
+        if (f.has(Fix::kSats)) o["sat"] = f.sats;
+        if (f.has(Fix::kHdop)) o["hdop"] = roundTo(f.hdopDeci / 10.0, 1);
+        // Not in protocol v1 (unknown fields are ignored): estimated error, metres at 1 sigma.
+        if (f.has(Fix::kAcc)) o["acc"] = f.accM;
+    }
+    if (msg.batV) doc["batV"] = roundTo(*msg.batV, 2);
+    if (msg.rssiDbm) doc["rssi"] = *msg.rssiDbm;
+    return serializeWhole(doc, buf, cap);
+}
+
 }  // namespace core

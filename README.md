@@ -73,10 +73,30 @@ PLATFORMIO_BUILD_FLAGS="-isystem $(xcrun --show-sdk-path)/usr/include/c++/v1" pi
 
 ### Next version: accelerometer
 
-Add a low-power accelerometer with a hardware wake-up interrupt, such as the ST LIS2DH12 or LIS3DH (I²C, a few µA in
-low-power mode, configurable motion threshold and duration). Wire its INT1 to an RTC-capable GPIO so it can wake the
-ESP32 from deep sleep (`ext1`). The firmware already has the `MotionSensor` interface; adding the sensor means writing a
-driver and turning on motion-gated `GPS_ACQUIRE` and the idle timers.
+The chosen sensor is the **Analog Devices ADXL345** (3-axis, I²C, 2.0–3.6 V). Its activity interrupt (`THRESH_ACT`,
+62.5 mg/LSB, with `ACT_INACT_CTL` picking the axes) drives INT1, and an RTC-capable GPIO lets it wake the ESP32 from
+deep sleep (`ext1`). The INT pins are push-pull and active-high by default, which suits `ESP_EXT1_WAKEUP_ANY_HIGH`.
+Activity detection only runs in measurement mode, about 23–40 µA (0.1 µA in standby). That's more than a LIS3DH /
+LIS2DH12 (a few µA) but small next to the modem's idle draw. The firmware already has the `MotionSensor` interface;
+adding the sensor means writing an ADXL345 driver and turning on motion-gated `GPS_ACQUIRE` and the idle timers.
+
+- On our breakout SDO/ALT ADDRESS is tied low and CS is tied high (I²C mode), so the I²C address is **0x53**.
+  `DEVID` (register 0x00) reads 0xE5.
+
+Wiring, all on the right-hand header (modem side up, MAIN antenna at the top, pins counted from the top):
+
+| Sensor | Board pin | Header pin | Note |
+|---|---|---|---|
+| VCC | 3V3 | 1 | |
+| INT1 | GPIO34 | 5 | Input-only RTC pin, `ext1` wake. No internal pulls; the sensor drives the line. |
+| INT2 | GPIO35 | 6 | Same as GPIO34. |
+| SDA | GPIO32 | 7 | I²C needs output-capable pins, so not 34/35: `Wire.begin(32, 33)`. |
+| SCL | GPIO33 | 8 | |
+| GND | GND | 14 | Between IO12 and IO13. |
+
+Header order comes from LilyGO's [T-Call-A7670 V1.0 schematic](https://github.com/Xinyuan-LilyGO/LilyGo-Modem-Series/blob/main/schematic/esp32/T-Call-A7670-V1.0.pdf).
+Don't use IO16/IO17 (WROVER PSRAM) or the strapping pins IO0/IO2/IO5/IO15. Still free: IO18, IO19, IO21, IO22, IO23,
+GPIO36 (S_VP) and GPIO39 (S_VN).
 
 ### Bus-voltage detector and self-disconnect (recommendation)
 
@@ -84,8 +104,8 @@ The lifecycle doc needs two separate things. Keep them separate in hardware:
 
 **1. Firmware measurement (tiers, `batV`, charging detection)**
 
-- Divider from the switched 12 V bus to an **ADC1** pin. ADC2 is unusable while the radio is active. GPIO34 and GPIO35
-  are input-only ADC1 pins; check against the T-Call V1.0 schematic that the one you pick is free.
+- Divider from the switched 12 V bus to an **ADC1** pin. ADC2 is unusable while the radio is active. Use GPIO36
+  (S_VP) or GPIO39 (S_VN): input-only ADC1 pins, free on the right-hand header. GPIO34/35 carry the accelerometer IRQs.
 - **1 MΩ (top) / 180 kΩ (bottom) + 100 nF** from the ADC pin to GND. Full scale is about 16 V at 2.44 V on the pin, which is
   inside the ESP32's accurate range at 11 dB attenuation. The divider draws about 11 µA at 12.6 V. The capacitor is
   needed because the divider impedance is high for the ESP32 ADC.

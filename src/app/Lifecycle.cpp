@@ -45,6 +45,11 @@ void Lifecycle::begin() {
 }
 
 void Lifecycle::tick() {
+    if (modemReady_) {
+        // Drain URCs (NMEA, MQTT notices) every pass, whatever the state.
+        d_.modem.at().poll();
+        d_.tracking.sample(millis());
+    }
     switch (state_) {
         case State::PowerOn: stepPowerOn(); break;
         case State::Network: stepNetwork(); break;
@@ -61,6 +66,7 @@ void Lifecycle::transition(State next, const char* reason) {
          static_cast<unsigned long>(millis() - enteredAtMs_));
     state_ = next;
     enteredAtMs_ = millis();
+    if (next == State::Network) d_.net.begin(enteredAtMs_);
     platform::board::setLed(next == State::Online);
 }
 
@@ -71,10 +77,13 @@ void Lifecycle::fail(const char* reason) {
     if (consecutiveFailures_ >= kFailuresBeforeModemReset) {
         LOGW(TAG, "%lu failures in a row, resetting modem", static_cast<unsigned long>(consecutiveFailures_));
         d_.modem.reset();
+        modemReady_ = false;
+        d_.tracking.onModemReset();
         consecutiveFailures_ = 0;
         resumeState_ = State::PowerOn;
     } else {
-        resumeState_ = (state_ == State::PowerOn) ? State::PowerOn : State::Network;
+        // Retry the failed step itself where that makes sense; otherwise re-check the network.
+        resumeState_ = (state_ == State::PowerOn || state_ == State::Clock) ? state_ : State::Network;
     }
     LOGW(TAG, "%s failed: %s; retry in %lu s", stateName(state_), reason, static_cast<unsigned long>(backoffMs_ / 1000));
     transition(State::Backoff, reason);
@@ -122,6 +131,7 @@ bool Lifecycle::sendBoot() {
 
 void Lifecycle::stepPowerOn() {
     if (!d_.modem.powerOn()) return fail("modem not answering");
+    modemReady_ = true;
     d_.modem.logIdentity();
     if (!certsChecked_) {
         if (!certificatesPresent()) return transition(State::Halted, "certificates missing");
@@ -131,12 +141,19 @@ void Lifecycle::stepPowerOn() {
 }
 
 void Lifecycle::stepNetwork() {
-    if (!d_.net.bringUp()) return fail("network");
+    switch (d_.net.poll(millis())) {
+        case services::NetworkLink::Status::Pending: return;
+        case services::NetworkLink::Status::Failed: return fail("network");
+        case services::NetworkLink::Status::Up: break;
+    }
+    // GNSS may have set the clock already; NTP is only needed without a lock.
     transition(d_.clock.isSet() ? State::Mqtt : State::Clock, "registered");
 }
 
 void Lifecycle::stepClock() {
-    if (!d_.clock.syncFromNtp(config::kNtpServer)) return fail("clock");
+    // GNSS may have set the clock while we were backing off.
+    if (d_.clock.isSet()) return transition(State::Mqtt, "clock set by gnss");
+    if (!d_.clock.syncFromNtp(config::kNtpServers, config::kNtpServerCount)) return fail("clock");
     transition(State::Mqtt, "clock set");
 }
 
@@ -153,15 +170,15 @@ void Lifecycle::stepMqtt() {
     consecutiveFailures_ = 0;
     backoffMs_ = 0;
     transition(State::Online, why);
+    d_.tracking.onLinkUp();
 }
 
 void Lifecycle::stepOnline() {
-    d_.modem.at().poll();
-    if (!d_.mqtt.isConnected()) fail("mqtt connection lost");
+    if (!d_.mqtt.isConnected()) return fail("mqtt connection lost");
+    d_.tracking.report(millis());
 }
 
 void Lifecycle::stepBackoff() {
-    d_.modem.at().poll();
     if (millis() - enteredAtMs_ >= backoffMs_) transition(resumeState_, "backoff over");
 }
 

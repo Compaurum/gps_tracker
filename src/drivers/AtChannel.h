@@ -24,6 +24,7 @@ public:
 // Line-oriented AT command engine over the modem UART. It is the only reader of the stream:
 // every line that is not the answer to the current command is dispatched to the URC listeners
 // instead of being dropped, which is what TinyGSM does and why it is not used here.
+// Lines starting with '$' (the GNSS NMEA stream) are always unsolicited and never traced.
 class AtChannel {
 public:
     using LineFn = void (*)(const char* line, void* ctx);

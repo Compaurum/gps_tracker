@@ -19,9 +19,10 @@ public:
     // Full modem reset (AT+CRESET), for recovery when it is stuck. powerOn() must follow.
     void reset();
 
-    bool waitSimReady(uint32_t timeoutMs);
-    // Waits for LTE (CEREG) or 2G (CREG) registration, home or roaming.
-    bool waitRegistered(uint32_t timeoutMs);
+    // Single checks, no waiting: the caller polls (services/NetworkLink).
+    bool isSimReady();
+    // LTE (CEREG) or 2G (CREG), home (stat 1) or roaming (stat 5). `rat` gets "LTE" or "2G".
+    bool isRegistered(int* stat, const char** rat);
     // Defines the PDP context (if `apn` is non-empty) and makes sure it is active.
     bool activateData(const char* apn);
 

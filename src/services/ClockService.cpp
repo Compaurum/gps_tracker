@@ -12,16 +12,22 @@ static const char* const TAG = "CLOCK";
 ClockService::ClockService(drivers::A7670Modem& modem)
     : modem_(modem) {}
 
-bool ClockService::syncFromNtp(const char* server) {
-    auto ms = modem_.ntpTimeMs(server);
-    if (!ms) return false;
-    // A successful NTP answer before 2020 means something upstream is broken; don't use it.
-    if (*ms < core::kMinPlausibleEpochMs) {
-        LOGE(TAG, "NTP returned %lu s, ignored", static_cast<unsigned long>(*ms / 1000));
-        return false;
+bool ClockService::syncFromNtp(const char* const* servers, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        auto ms = modem_.ntpTimeMs(servers[i]);
+        if (!ms) {
+            LOGW(TAG, "NTP %s failed", servers[i]);
+            continue;
+        }
+        // A successful NTP answer before 2020 means something upstream is broken; don't use it.
+        if (*ms < core::kMinPlausibleEpochMs) {
+            LOGE(TAG, "NTP %s returned %lu s, ignored", servers[i], static_cast<unsigned long>(*ms / 1000));
+            continue;
+        }
+        set(*ms, servers[i]);
+        return true;
     }
-    set(*ms, "ntp");
-    return true;
+    return false;
 }
 
 void ClockService::set(int64_t epochMs, const char* source) {

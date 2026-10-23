@@ -138,6 +138,11 @@ AtResult AtChannel::run(uint32_t timeoutMs, const char* prefix, LineFn fn, void*
             result = AtResult::Error;
             break;
         }
+        // NMEA sentences from the GNSS stream are never the answer to a command.
+        if (line_[0] == '$') {
+            dispatch(line_);
+            continue;
+        }
         if (prefix && core::startsWith(line_, prefix)) {
             if (fn) fn(line_, ctx);
             continue;
@@ -177,7 +182,7 @@ bool AtChannel::waitFor(const char* prefix, char* out, size_t cap, uint32_t time
         const uint32_t elapsed = millis() - start;
         if (elapsed >= timeoutMs) return false;
         if (readInto(timeoutMs - elapsed, false) == Read::Timeout) return false;
-        if (core::startsWith(line_, prefix)) {
+        if (line_[0] != '$' && core::startsWith(line_, prefix)) {
             if (out && cap) strlcpy(out, line_, cap);
             return true;
         }
@@ -186,9 +191,18 @@ bool AtChannel::waitFor(const char* prefix, char* out, size_t cap, uint32_t time
 }
 
 bool AtChannel::readLine(char* out, size_t cap, uint32_t timeoutMs) {
-    if (readInto(timeoutMs, false) != Read::Line) return false;
-    strlcpy(out, line_, cap);
-    return true;
+    const uint32_t start = millis();
+    for (;;) {
+        const uint32_t elapsed = millis() - start;
+        if (elapsed >= timeoutMs || readInto(timeoutMs - elapsed, false) != Read::Line) return false;
+        // NMEA can land between the lines of a multi-line URC; hand it on and keep reading.
+        if (line_[0] == '$') {
+            dispatch(line_);
+            continue;
+        }
+        strlcpy(out, line_, cap);
+        return true;
+    }
 }
 
 size_t AtChannel::readRaw(void* buf, size_t len, uint32_t timeoutMs) {
@@ -242,7 +256,8 @@ AtChannel::Read AtChannel::readInto(uint32_t timeoutMs, bool promptOk) {
             len_ = 0;
             if (overflow_) LOGW(TAG, "line truncated to %u bytes", static_cast<unsigned>(kMaxLine - 1));
             overflow_ = false;
-            if (trace_) LOGI(TAG, "< %s", line_);
+            // The GNSS NMEA stream (3 lines a second) would drown the trace.
+            if (trace_ && line_[0] != '$') LOGI(TAG, "< %s", line_);
             return Read::Line;
         }
         if (len_ == 0 && c == ' ') continue;  // the space after a '>' prompt
